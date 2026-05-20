@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: ai-brand-scale
+    runtime: python
+    plan: starter   # $7/mo — required for always-on; use "free" for testing (sleeps after 15min)
+    region: frankfurt
+    pythonVersion: "3.11"
+    buildCommand: pip install -r requirements.txt
+    startCommand: python3 execution/brand_scraper_server.py
+    healthCheckPath: /
+    envVars:
+      - key: KIE_AI_API_KEY
+        sync: false       # set in Render dashboard
+      - key: SESSION_SECRET
+        generateValue: true
+    disk:
+      name: ai-brand-data
+      mountPath: /opt/render/project/src/.tmp
+      sizeGB: 5

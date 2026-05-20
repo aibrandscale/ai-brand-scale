@@ -1,0 +1,12 @@
+.env
+.tmp/
+__pycache__/
+*.pyc
+.git/
+.DS_Store
+node_modules/
+*.mp4
+*.MOV
+context/
+directives/
+*.md

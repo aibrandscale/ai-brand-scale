@@ -1,0 +1,12 @@
+{
+  "accounts": {
+    "beMe": {
+      "ad_account_id": "act_332589681007554",
+      "fb_page_id": "431985730915141",
+      "ig_page_id": "17841415155885204",
+      "pixel_id": "715594639029877"
+    }
+  },
+  "naming_template": "{date}_{account}_{concept}_{format}_{ratio}",
+  "default_utm": "utm_source={{site_source_name}}&utm_medium={{placement}}&utm_campaign={{campaign.name}}&utm_term={{adset.name}}&utm_content={{ad.name}}&fbadid={{ad.id}}"
+}

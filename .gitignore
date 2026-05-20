@@ -1,0 +1,29 @@
+# Secrets
+.env
+
+# Local data (DON'T commit users / job state)
+.tmp/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# macOS
+.DS_Store
+
+# Editors
+.vscode/
+.idea/
+.claude/
+
+# Large media (user can re-add as needed)
+*.mp4
+*.MOV
+*.mov
+
+# Logs
+*.log
+/tmp/*
