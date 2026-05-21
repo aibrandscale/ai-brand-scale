@@ -37,6 +37,10 @@ KIE_AI_KEY = os.environ.get('KIE_AI_API_KEY', '')
 # ═════════════════════════════════════════════
 import hashlib, hmac, secrets
 
+# Postgres data layer. When DATABASE_URL is set, users come from DB;
+# otherwise we fall back to .tmp/users.json (local dev convenience).
+import db as _db
+
 USERS_FILE = Path(__file__).parent.parent / '.tmp' / 'users.json'
 USERS_FILE.parent.mkdir(parents=True, exist_ok=True)
 SESSION_SECRET = os.environ.get('SESSION_SECRET', 'abs-session-secret-v1-change-me')
@@ -92,20 +96,38 @@ def signup_user(email, password, name=''):
     email = (email or '').strip().lower()
     if not email or '@' not in email or len(password) < 6:
         return {'error': 'Невалиден имейл или парола твърде кратка (мин 6 символа)'}
+    name = (name or email.split('@')[0])
+    password_hash = _hash_pw(password)
+    user_id = secrets.token_hex(8)
+
+    if _db.is_enabled():
+        ok = _db.user_insert(user_id, email, name, password_hash)
+        if not ok:
+            return {'error': 'Имейлът вече е регистриран'}
+        return {'user': {'id': user_id, 'email': email, 'name': name}, 'token': make_token(user_id)}
+
+    # Filesystem fallback
     users = _load_users()
     if email in users:
         return {'error': 'Имейлът вече е регистриран'}
-    user_id = secrets.token_hex(8)
     users[email] = {
-        'id': user_id, 'email': email, 'name': name or email.split('@')[0],
-        'password': _hash_pw(password),
+        'id': user_id, 'email': email, 'name': name,
+        'password': password_hash,
         'created': int(__import__('time').time()),
     }
     _save_users(users)
-    return {'user': {'id': user_id, 'email': email, 'name': users[email]['name']}, 'token': make_token(user_id)}
+    return {'user': {'id': user_id, 'email': email, 'name': name}, 'token': make_token(user_id)}
 
 def login_user(email, password):
     email = (email or '').strip().lower()
+
+    if _db.is_enabled():
+        u = _db.user_get_by_email(email)
+        if not u or not _verify_pw(password, u['password']):
+            return {'error': 'Невалиден имейл или парола'}
+        return {'user': {'id': u['id'], 'email': u['email'], 'name': u['name']}, 'token': make_token(u['id'])}
+
+    # Filesystem fallback
     users = _load_users()
     u = users.get(email)
     if not u or not _verify_pw(password, u['password']):
@@ -114,10 +136,80 @@ def login_user(email, password):
 
 def get_user_by_id(user_id):
     if not user_id: return None
+
+    if _db.is_enabled():
+        return _db.user_get_by_id(user_id)
+
+    # Filesystem fallback
     for u in _load_users().values():
         if u.get('id') == user_id:
             return {'id': u['id'], 'email': u['email'], 'name': u.get('name','')}
     return None
+
+
+# ═════════════════════════════════════════════
+# ─── JOB HISTORY (DB-backed, no-op if no DB) ─
+# ═════════════════════════════════════════════
+
+def _stage_to_status(state):
+    """Map an in-memory job state dict to a normalized history status."""
+    if not state: return 'running'
+    if state.get('cancelled'): return 'cancelled'
+    if state.get('error') or state.get('stage') == 'error': return 'failed'
+    stage = state.get('stage', '')
+    if stage == 'done': return 'done'
+    if stage == 'queued': return 'queued'
+    return 'running'
+
+
+def _job_title(brief):
+    if not isinstance(brief, dict): return ''
+    brand = (brief.get('brand') or '').strip()
+    product = (brief.get('product') or brief.get('product_name') or '').strip()
+    if brand and product: return f'{brand} — {product}'
+    return brand or product or ''
+
+
+def _history_record_create(job_id, user_id, feature, brief):
+    """Insert a job history row at job creation. No-op if DB not configured or no user_id."""
+    if not _db.is_enabled() or not user_id:
+        return
+    try:
+        _db.history_record(
+            job_id=job_id,
+            user_id=user_id,
+            feature=feature,
+            title=_job_title(brief),
+            brief=brief if isinstance(brief, dict) else None,
+            status='queued',
+        )
+    except Exception as e:
+        print(f'[history] record_create failed for {job_id}: {e}', file=sys.stderr)
+
+
+def _history_sync(job_id, state, feature):
+    """Sync a state dict to the history row. Called on every _save_state."""
+    if not _db.is_enabled():
+        return
+    if not state or not state.get('user_id'):
+        return
+    try:
+        status = _stage_to_status(state)
+        result = None
+        error = None
+        if status == 'done':
+            # Compact summary for the UI — full state stays on disk
+            result = {
+                'progress_pct': state.get('progress_pct', 100),
+                'completed': state.get('completed', {}),
+                'video_url': state.get('video_url') or state.get('final_video'),
+                'preview_url': state.get('preview_url') or state.get('html_url'),
+            }
+        elif status == 'failed':
+            error = str(state.get('error') or state.get('stage_label') or 'unknown error')[:500]
+        _db.history_update_status(job_id, status, result=result, error=error)
+    except Exception as e:
+        print(f'[history] sync failed for {job_id}: {e}', file=sys.stderr)
 
 USER_AGENT = (
     'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) '
@@ -1341,6 +1433,7 @@ def _adv_save_state(job_id, state):
     p = ADV_JOBS_DIR / job_id
     p.mkdir(parents=True, exist_ok=True)
     (p / 'state.json').write_text(json.dumps(state, ensure_ascii=False), encoding='utf-8')
+    _history_sync(job_id, state, feature='advertorial')
 
 
 def adv_create_job(brief, user_id=None):
@@ -1351,6 +1444,7 @@ def adv_create_job(brief, user_id=None):
         'progress_pct': 0, 'completed': {},
     }
     ADV_JOBS[job_id] = state
+    _history_record_create(job_id, user_id, 'advertorial', brief)
     _adv_save_state(job_id, state)
     (ADV_JOBS_DIR / job_id / 'brief.json').write_text(json.dumps(brief, ensure_ascii=False), encoding='utf-8')
     threading.Thread(target=adv_run_pipeline, args=(job_id, brief), daemon=True).start()
@@ -1758,6 +1852,7 @@ def _pixar_save_state(job_id, state):
     p = PIXAR_JOBS_DIR / job_id
     p.mkdir(parents=True, exist_ok=True)
     (p / 'state.json').write_text(json.dumps(state, ensure_ascii=False), encoding='utf-8')
+    _history_sync(job_id, state, feature='pixar')
 
 
 def _pixar_run_pipeline(job_id, brief):
@@ -1995,6 +2090,7 @@ def pixar_create_job(brief, user_id=None):
         'cancelled': False,
     }
     PIXAR_JOBS[job_id] = state
+    _history_record_create(job_id, user_id, 'pixar', brief)
     _pixar_save_state(job_id, state)
     # Persist brief
     (PIXAR_JOBS_DIR / job_id / 'brief.json').write_text(json.dumps(brief, ensure_ascii=False), encoding='utf-8')
@@ -2424,6 +2520,27 @@ class Handler(BaseHTTPRequestHandler):
                 self._reply(200, state)
             else:
                 self._reply(404, {'error':'not found'})
+            return
+
+        # ── Cross-feature job history (DB-backed) ──
+        if parsed.path == '/api/history':
+            uid = auth_user_id(self.headers)
+            if not uid:
+                self._reply(401, {'error': 'auth required'}); return
+            if not _db.is_enabled():
+                self._reply(503, {'error': 'history requires DATABASE_URL', 'jobs': []}); return
+            params = urllib.parse.parse_qs(parsed.query)
+            feature = (params.get('feature', [''])[0] or '').strip() or None
+            try:
+                limit = max(1, min(200, int(params.get('limit', ['50'])[0])))
+            except Exception:
+                limit = 50
+            try:
+                jobs = _db.history_list_by_user(uid, feature=feature, limit=limit)
+                self._reply(200, {'jobs': jobs})
+            except Exception as e:
+                print(f'[api/history] {e}', file=sys.stderr)
+                self._reply(500, {'error': 'history query failed'})
             return
 
         if parsed.path == '/scrape-product':
